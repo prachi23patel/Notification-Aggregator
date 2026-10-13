@@ -1,0 +1,18 @@
+fastapi[standard]
+uvicorn[standard] 
+# Starts a web server , Listens for incoming requests ,  passes those requests to FastAPI, sends back the response
+sqlalchemy # database toolkit + ORM (Object Relational Mapper). Lets you work with databases using Python objects instead of raw SQL
+psycopg2-binary # low-level database driver specifically for PostgreSQL. Connects Python → PostgreSQL database
+
+# python-jose PyJWT both deal with JWTs, but they’re not identical in scope or design:
+# python-jose[cryptography] # python-jose[cryptography] is a package used for handling (JWT, JWS, JWE = signing + encryption) tokens
+pyJWT # focused JWT only
+
+# Password hashing → Passlib + bcrypt and pwdlib[argon2] bith can be used
+# passlib[bcrypt] # passlib[bcrypt] is used for secure password hashing and verification
+pwdlib[argon2] # Newer, modern approach
+
+python-multipart # This library is used to handle form data, especially when a request includes files.
+pydantic[email] # Pydantic is used for data validation and parsing in FastAPI.
+python-dotenv # load environment variables from a .env file into your app.
+alembic # used for database migrations (changing your DB schema safely over time).
