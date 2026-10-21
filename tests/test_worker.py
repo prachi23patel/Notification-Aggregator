@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from app.models.events import events
 from app.models.notifications import Notify
 from app.models.aggregated_notifications import AggregatedNotification
-from app.routers.worker import Worker
+from app.routers.worker import Worker , MAX_RETRIES
 
 
 # ==================================================
@@ -893,3 +893,73 @@ async def test_missing_entity_id_skips_aggregation(session_factory):
             )
         )
         assert result.scalar_one_or_none() is not None
+
+# ==================================================
+# Test: Event exceeding maximum retries goes to DLQ
+# ==================================================
+@pytest.mark.asyncio
+async def test_event_exceeding_max_retries_goes_to_dlq(
+    session_factory,
+    redis_client
+):
+    event_id = f"dead-test-{uuid.uuid4()}"
+
+    event_data = {
+        "event_id": event_id,
+        "event_type": "COMMENT_CREATED",
+        "user_id": 1,
+        "source": "dead_letter_test",
+        "payload": {"message": "test"},
+        "retry_count": MAX_RETRIES,
+    }
+
+    # Put the event into the main queue.
+    await redis_client.rpush(
+        "queue:events",
+        json.dumps(event_data)
+    )
+
+    worker = Worker(
+        session_factory=session_factory,
+        redis=redis_client
+    )
+
+    # Simulate another processing failure.
+    async def failing_process(event):
+        raise RuntimeError("Simulated permanent failure")
+
+    worker.event_process = failing_process
+
+    # Process the event; it should exceed the retry limit.
+    result = await worker.process_one_event()
+
+    assert result is False
+
+    # Verify the event reached the dead-letter queue.
+    dead_items = await redis_client.lrange(
+        "queue:dead", 0, -1
+    )
+    dead_events = [json.loads(item) for item in dead_items]
+
+    assert any(
+        item["event_id"] == event_id
+        for item in dead_events
+    )
+
+    # Verify it was removed from the processing queue.
+    processing_items = await redis_client.lrange(
+        "queue:processing", 0, -1
+    )
+    assert not any(
+        json.loads(item)["event_id"] == event_id
+        for item in processing_items
+    )
+
+    # Verify it was not scheduled for another retry.
+    retry_items = await redis_client.zrange(
+        "retry:scheduled", 0, -1
+    )
+    assert not any(
+        json.loads(item)["event_id"] == event_id
+        for item in retry_items
+    )

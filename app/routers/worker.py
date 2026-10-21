@@ -76,7 +76,10 @@ class Worker:
         source = event_data["source"]
         user_id = event_data["user_id"]
         payload = event_data.get("payload") or {}
-        entity_id = payload.get("entity_id")
+        entity_id = (
+            event_data.get("entity_id")
+            or payload.get("entity_id")
+        )
 
 
         logger.info(
@@ -132,10 +135,6 @@ class Worker:
                 # roll back the notification insert too.
                 if result.rowcount == 0:
                     raise EventNotFoundError(event_id)
-                    logger.error(
-                        f"Event not found in database: {event_id}"
-                    )
-                    return False
                 # ================================================
                 # STEP 3: Handle duplicate event
                 # ================================================
@@ -296,13 +295,10 @@ class Worker:
             # =================================================
             # PROCESS EVENT
             # =================================================
-
             success = await self.event_process(task)
-
             # -------------------------------------------------
             # Event was not found in PostgreSQL
             # -------------------------------------------------
-
             if success is False:
 
                 await self.queue.remove_after_processing(
@@ -334,7 +330,16 @@ class Worker:
         # =====================================================
         # PROCESSING FAILED
         # =====================================================
+        except EventNotFoundError as e:
+            logger.error(
+                f"Event {event_id} was not found in PostgreSQL. "
+                "Moving it directly to the dead-letter queue."
+            )
 
+            await self.queue.move_to_dead_queue(task)
+            await self.queue.remove_after_processing(raw_json)
+
+            return False
         except Exception as e:
 
             logger.exception(
@@ -361,9 +366,9 @@ class Worker:
                     f"Moving to dead-letter queue."
                 )
 
-                await self.queue.move_to_dead_queue(
-                    task
-                )
+                await self.queue.move_to_dead_queue(task)
+                await self.queue.remove_after_processing(raw_json)
+                # both move_to_dead_queue and remove_after_processing should be atomic
 
             # =================================================
             # SCHEDULE NEXT RETRY

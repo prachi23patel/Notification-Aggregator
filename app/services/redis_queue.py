@@ -55,57 +55,77 @@ class RedisQueue:
                 )
                 return False
 
-    async def dequeue_blocking_left(self, timeout: int = 2) -> Dict[str, Any] | None:
-            """Blocks and extracts an item from the LEFT side of the list.
-            If empty for 'timeout' seconds, returns None and exits cleanly.
+    async def dequeue_blocking_left(self, timeout: int = 2) -> tuple[str, Dict[str, Any]] | None:
+            """Blocks and extracts an item from the LEFT side of the list."""
             """
-            """
-            1.Uses BLPOP to wait for and remove the leftmost event from queue:events.
-            2.Moves the raw JSON to queue:processing.
-            3.Parses the JSON into a Python dictionary.
-            4.Returns both forms.
+            Atomically move an event from the main queue
+            to the processing queue, then decode it.
             """
 
-            # blpop returns a tuple: (queue_name, item_data)
-            # When no event arrives before the timeout, it returns: None
-            result = await self.redis.blpop(EVENT_QUEUE, timeout=timeout)
-            if result:
-                _, item_data = result
-                try:
-                    await self.redis.rpush(PROCESS_QUEUE, item_data)
-                    logger.info(f"✓ Event successfully buffered into process queue.")
-                    task = json.loads(item_data)
-                    return item_data, task
-    
-                except Exception as e:
-                    # 🟢 SWALLOW ERROR & LOG IT: Prevents the API request thread from breaking
-                    logger.critical(
-                        f"⚠️ REDIS QUEUE DOWN! Could not enqueue event into process queue. "
-                        f"Data will remain safe in PostgreSQL. Error details: {e}"
-                    )
-                    return None
+            # Atomically move the oldest event:
+            # queue:events -> queue:processing
+            # The BLMOVE command blocks for a specified timeout if the source list is empty, waiting for an item to arrive. If an item is available, it moves it to the destination list and returns it. If the timeout expires without an item arriving, it returns None.
+            item_data = await self.redis.blmove(
+                EVENT_QUEUE,
+                PROCESS_QUEUE,
+                timeout=timeout,
+                src="LEFT",
+                dest="RIGHT"
+            )
+
+            # No event arrived before the timeout.
+            if item_data is None:
+                return None
+
+            # Parse the JSON after the atomic move.
+            try:
+                task = json.loads(item_data)
+
+            except json.JSONDecodeError:
+                logger.exception(
+                    "Invalid JSON found in processing queue."
+                )
+                await self.move_raw_to_dead_queue(item_data)
+                return None
+            logger.info(
+                "Event atomically moved to processing queue."
+            )
+
+            # Keep the raw JSON for later removal.
+            # Return the parsed dictionary for processing.
+            return item_data, task
+
             
     async def recover_processing_queue(self):
-        """Recovers events from the processing queue back to the main event queue.
-        This is useful if a worker crashes while processing an event, ensuring that the event isn't lost"""
+        """
+        Atomically move all events left in the processing
+        queue back to the main queue during worker startup.
+        """
+        recovered = 0
+
         while True:
-            try:
-                result = await self.redis.lpop(PROCESS_QUEUE)
+            # LMOVE moves an item immediately,
+            # LMOVE, which atomically moves an item from one Redis list to another without blocking.
+            item_data = await self.redis.lmove(
+                PROCESS_QUEUE,#PROCESS_QUEUE is the source.
+                EVENT_QUEUE,#EVENT_QUEUE is the destination.
+                "LEFT",#LEFT selects the item from the left side of the processing list.
+                "RIGHT"#RIGHT places it at the right side of the main queue.
+            )
 
-                if result is None:
-                    break
-
-                await self.redis.rpush(EVENT_QUEUE, result)
-
-                logger.info(
-                    "Recovered event from processing queue."
-                )
-
-            except Exception as e:
-                logger.error(
-                    f"Could not recover event: {e}"
-                )
+            if item_data is None:
                 break
+
+            recovered += 1
+
+        if recovered:
+            logger.warning(
+                f"Recovered {recovered} event(s) "
+                "from the processing queue."
+            )
+
+        return recovered
+
 
     async def schedule_retry(self, event_data: dict):
 
@@ -130,52 +150,46 @@ class RedisQueue:
         )
 
     async def process_scheduled_retries(self):
-        """Adds the event back to queue:events.
-            Removes it from retry:scheduled."""
+        '''Redis executes the Lua script as one atomic operation:
+        - If the event is still scheduled, it removes it and pushes it into the main queue.
+        - If another worker already removed it, the script does nothing.
+        - If the worker crashes between the removal and insertion steps, that gap no longer exists.
+        '''
+        """Atomically move due retries back to the main queue."""
+
         current_time = time.time()
 
-        # Return every member whose score is between 0 and the current timestamp.
-        # Nothing has been removed from Redis yet. This operation only retrieves the due items.
         items = await self.redis.zrangebyscore(
             RETRY_QUEUE,
             0,
             current_time
         )
 
+        # Redis executes this script atomically.
+        script = """
+        local removed = redis.call('ZREM', KEYS[1], ARGV[1])
+
+        if removed == 1 then
+            redis.call('RPUSH', KEYS[2], ARGV[1])
+            return 1
+        end
+
+        return 0
+        """
+
         for raw_json in items:
-
-            # ZREM removes that particular member from the Sorted Set.
-            # Why remove it? Because this event is about to leave the scheduled-retry stage and return to the normal queue.
-            # returns : 1 — the member was removed.
-            # returns : 0 — the member was not present, perhaps because another worker already removed it.
-
-
-            # -----------
-            # ADD it to the project 
-            # -----------
-            # Worker crashes after ZREM but before RPUSH
-            # Redis Lua script that removes the due member and pushes it to queue:events as one operation. That removes the gap between the two commands.
-            removed = await self.redis.zrem(
+            moved = await self.redis.eval(
+                script,
+                2,
                 RETRY_QUEUE,
-                raw_json
-            )
-
-            # Worker 1                       Worker 2
-            #   ├── Finds event A               ├── Finds event A
-            #   ├── ZREM event A → 1            ├── ZREM event A → 0
-            #   ├── Continue                    └── Skip
-            #   └── Requeue event A
-            if removed == 0:
-                continue
-
-            # Put back into normal queue
-            await self.redis.rpush(
                 EVENT_QUEUE,
                 raw_json
             )
 
+            if moved == 0:
+                continue
+
             try:
-                # Decode the JSON for logging
                 event_data = json.loads(raw_json)
 
                 logger.info(
@@ -183,11 +197,37 @@ class RedisQueue:
                     f"{event_data['event_id']}."
                 )
 
-            # Handle malformed JSON
             except json.JSONDecodeError:
                 logger.error(
                     "Could not decode scheduled retry event."
                 )
+    async def move_raw_to_dead_queue(self, raw_json: str):
+        """Atomically move malformed JSON to the dead-letter queue."""
+
+        script = """
+        local removed = redis.call('LREM', KEYS[1], 1, ARGV[1])
+
+        if removed == 1 then
+            redis.call('RPUSH', KEYS[2], ARGV[1])
+            return 1
+        end
+
+        return 0
+        """
+
+        moved = await self.redis.eval(
+            script,
+            2,
+            PROCESS_QUEUE,
+            DEAD_QUEUE,
+            raw_json
+        )
+
+        if moved:
+            logger.error(
+                "Malformed event moved from processing "
+                "queue to dead-letter queue."
+            )
     async def move_to_dead_queue(self, event_data: dict):
         """Moves an event to the dead-letter queue after exceeding retry attempts."""
         raw_json = json.dumps(event_data)
