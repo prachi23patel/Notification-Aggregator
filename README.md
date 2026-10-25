@@ -146,72 +146,133 @@ The response field is named `notification_id` in the current code, but the UUID 
 
 ## Failure Handling and Reliability
 
-### 1. Outbox delivery
+This project uses multiple mechanisms to reduce event loss, recover interrupted work, and handle processing failures. These mechanisms improve reliability, but they do **not** provide exactly-once delivery across PostgreSQL and Redis.
 
-The event and its outbox record are committed together in PostgreSQL. If Redis enqueueing fails, the outbox worker leaves the record pending so it can be attempted again.
+### 1. Outbox Pattern: Keeping Delivery Intent Durable
 
-This preserves the delivery intent, but it does not guarantee exactly-once delivery. If Redis accepts a payload and the outbox worker fails before the PostgreSQL transaction commits, the payload may be enqueued again.
+When an event is accepted, the application writes both the original event and its outbox record in the same PostgreSQL transaction.
 
-### 2. Redis queues
+The outbox worker then:
+
+1. Selects pending outbox records in batches.
+2. Uses `FOR UPDATE SKIP LOCKED` to help concurrent outbox workers claim different records.
+3. Attempts to enqueue each payload into Redis.
+4. Marks the outbox record as delivered and sets `delivered_at` after a successful enqueue.
+5. Leaves the record pending if Redis enqueueing fails, allowing a later attempt.
+
+This means the event and the intent to deliver it are committed together, even if Redis is temporarily unavailable.
+
+**Important failure window:** Redis may accept an event and the outbox worker may then crash before the PostgreSQL transaction commits. The outbox record can remain pending and be sent again, so duplicate queue delivery is possible.
+
+### 2. Main Queue and Processing Queue
+
+The worker uses these Redis keys:
 
 | Redis key | Purpose |
 |---|---|
-| `queue:events` | Events waiting to be processed. |
-| `queue:processing` | Events currently being processed or awaiting acknowledgement. |
-| `retry:scheduled` | Sorted set containing failed events and their next retry timestamps. |
-| `queue:dead` | Dead-letter list for malformed or repeatedly failing events. |
+| `queue:events` | Holds events waiting to be processed. |
+| `queue:processing` | Holds events moved out of the main queue while processing is underway. |
+| `retry:scheduled` | A sorted set containing failed events and their next eligible retry timestamps. |
+| `queue:dead` | Stores malformed events and events that exceed the retry allowance. |
 
-### 3. Atomic queue movement and recovery
+The normal processing sequence is:
 
-- **`BLMOVE`:** Moves an event from `queue:events` to `queue:processing` in one Redis operation.
-- **`LMOVE`:** During worker startup, moves leftover entries from `queue:processing` back to `queue:events`.
-- **Processing acknowledgement:** After processing, the worker removes the event from `queue:processing`.
+1. `BLMOVE` moves an event from `queue:events` to `queue:processing` as one Redis operation.
+2. The worker attempts to process the event.
+3. After successful processing, the worker removes the event from `queue:processing`.
+4. If the worker stops unexpectedly while an event remains in the processing list, startup recovery can return that event to the main queue.
 
-These mechanisms reduce the risk of losing an event between the main and processing lists. Startup recovery is not the same as a continuous visibility-timeout mechanism for a worker that remains running.
+Using `BLMOVE` avoids a separate pop-then-push gap during the main-to-processing transfer.
 
-### 4. Exponential backoff
+### 3. Recovering Unfinished Events
 
-When processing raises an exception, the worker increments `retry_count` and calculates the delay as follows:
+When the background worker starts, it calls `recover_processing_queue()`.
+
+That method repeatedly uses `LMOVE` to move entries from `queue:processing` back to `queue:events` until the processing list is empty. This provides a recovery path for entries left behind by a previous worker run.
+
+**Limitation:** This recovery runs at worker startup. It is not a continuous visibility-timeout mechanism that detects a stalled event while the same worker process is still running.
+
+### 4. Retry Handling with Exponential Backoff
+
+When processing raises an exception, the worker increments the event's `retry_count` and schedules the next attempt.
+
+The delay is calculated as:
 
 ```python
-delay_seconds = 2 ** retry_count
+delay = 2 ** retry_count
 ```
 
-| Retry count | Scheduled delay |
+With the current counter logic, the retry schedule is:
+
+| Retry count | Delay before retry |
 |---:|---:|
 | 1 | 2 seconds |
 | 2 | 4 seconds |
 | 3 | 8 seconds |
 
-The worker allows **three retries after the initial attempt**. A subsequent failure exceeds the retry limit and is moved to `queue:dead`.
+The worker permits **three retries after the initial attempt**. When the retry count exceeds `MAX_RETRIES`, the event is sent to the dead-letter queue.
 
-### 5. Lua scripts
+Retry timestamps are stored in the Redis sorted set `retry:scheduled`. The worker checks for due retries during its processing loop.
 
-The project uses Lua scripts for two Redis transitions:
+### 5. Lua Script: Moving Scheduled Retries Atomically
 
-**Scheduled retry → main queue**
+When a retry becomes due, the worker uses a Redis Lua script to perform two actions:
 
-The script removes a due event from `retry:scheduled` and pushes it to `queue:events` as one atomic Redis-side operation.
+1. Remove the event from `retry:scheduled` using `ZREM`.
+2. Push the event onto `queue:events` using `RPUSH`.
 
-**Malformed processing item → dead-letter queue**
+Both actions occur within one Lua script execution, so another client cannot observe an intermediate state between the removal and push. If the sorted-set entry was already removed, the script does not enqueue it again.
 
-The script removes the malformed raw item from `queue:processing` and pushes it to `queue:dead` atomically.
+This avoids the specific crash window that would exist if the application performed the removal and push as two separate Redis commands.
 
-These scripts prevent a crash gap between the remove and push operations in those specific transitions.
+### 6. Lua Script: Moving Malformed Messages to the Dead-Letter Queue
 
-### 6. Database transactions and idempotency
+If the worker cannot decode JSON taken from the processing queue, it calls `move_raw_to_dead_queue()`.
 
-The worker performs the individual notification insert, event status update, and aggregation work inside a PostgreSQL transaction. If a database operation fails before commit, the transaction's changes roll back together.
+That Lua script:
 
-The `Notifications.event_id` column is unique. The worker uses `ON CONFLICT DO NOTHING` and checks whether the insert returned an ID. If the notification already exists, it skips aggregation for that duplicate event.
+1. Removes one matching raw message from `queue:processing` with `LREM`.
+2. Pushes the raw message onto `queue:dead` with `RPUSH`, only if the removal succeeded.
 
-### 7. Known reliability boundaries
+This makes the malformed-message transfer atomic within Redis, preventing the message from being left between the two lists due to a crash between separate commands.
 
-- Moving a normal failed event to `queue:dead` and removing its processing-list copy are separate Redis commands. A crash between them can leave copies in both lists.
-- PostgreSQL and Redis do not share a distributed transaction, so duplicate queue delivery remains possible.
-- Processing-queue recovery runs when the worker starts; it does not continuously reclaim work from a worker that is still running.
-- The aggregation key is indexed but is not declared unique in the database.
-- These mechanisms improve recovery and duplicate handling, but the project does **not** guarantee exactly-once processing across PostgreSQL and Redis.
+### 7. Database Transaction and Idempotency Safeguards
+
+The worker performs the individual notification insert, event status update, and aggregation work inside a PostgreSQL transaction.
+
+- If the event record is not found, the worker raises `EventNotFoundError`; the transaction rolls back.
+- If a database operation fails before commit, the related database changes in that transaction roll back together.
+- The `Notifications.event_id` field has a unique constraint.
+- The worker uses PostgreSQL `ON CONFLICT DO NOTHING` and checks whether the insert returned a notification ID.
+- If the notification already exists, the worker skips aggregation for that duplicate processing attempt.
+
+These safeguards make repeated processing safer and help prevent duplicate notification rows or duplicate aggregation increments through this worker path.
+
+They do not create a distributed transaction between PostgreSQL and Redis, and they do not guarantee that every event is processed exactly once.
+
+### 8. Dead-Letter Queue Behavior
+
+If a processing attempt fails beyond the retry limit, the worker sends the event to `queue:dead`. Malformed JSON encountered in the processing list is also routed to the dead-letter queue.
+
+The dead-letter queue provides a place to retain events that could not be processed normally instead of retrying them indefinitely.
+
+**Known limitation:** For a normal failed event, `move_to_dead_queue()` uses `RPUSH` and the worker then removes the processing copy using `LREM`. These are separate Redis commands, not one atomic Lua transfer. If the worker crashes between them, the event can exist in both lists.
+
+The reviewed implementation includes dead-letter storage, but not a complete operational workflow for inspecting, replaying, and managing dead-letter events.
+
+### 9. Reliability Boundaries
+
+| Mechanism | What it helps with | What it does not guarantee |
+|---|---|---|
+| PostgreSQL outbox | Preserves the intent to deliver an accepted event. | Exactly-once delivery from PostgreSQL to Redis. |
+| `BLMOVE` | Atomically moves an event from the main list to the processing list. | Automatic recovery from every possible worker failure. |
+| Startup `LMOVE` recovery | Returns leftover processing entries to the main queue. | Continuous recovery of stalled work while a worker remains running. |
+| Lua retry transfer | Atomically removes a due retry and enqueues it. | A distributed transaction between Redis and PostgreSQL. |
+| Lua malformed-message transfer | Atomically moves a malformed processing entry to the dead-letter list. | Atomic dead-letter transfer for normal processing exceptions. |
+| Unique notification event ID | Prevents duplicate individual notification rows for the same event ID. | Exactly-once processing across all systems. |
+| PostgreSQL transaction | Commits or rolls back related database changes together. | Rollback of Redis operations already completed. |
+
+The project therefore implements several practical reliability techniques—durable outbox records, atomic Redis list movement, Lua-based transitions, retries, dead-letter handling, database transactions, and idempotency safeguards—while retaining known crash windows that should be documented honestly.
 
 ---
 
@@ -226,7 +287,7 @@ The project defines four main SQLAlchemy models.
 | `Notify` | `Notifications` | Stores individual notifications. |
 | `AggregatedNotification` | `aggregated_notifications` | Stores grouped notification summaries. |
 
-### Important fields and constraints
+### Important Fields and Constraints
 
 | Model | Important fields / constraints | Why it matters |
 |---|---|---|
@@ -238,7 +299,7 @@ The project defines four main SQLAlchemy models.
 
 **Relationship note:** The models do not declare explicit foreign-key relationships between these four tables. Their event IDs connect records conceptually, but that is not the same as a database-enforced foreign key.
 
-### Aggregation logic
+### Aggregation Logic
 
 The aggregation key is constructed from the user ID, event type, and entity ID:
 
@@ -263,7 +324,7 @@ The worker looks for an aggregation with the same key that is unread and whose `
 
 The one-hour condition is a **sliding window** based on the latest event time, not a fixed hourly batch.
 
-### Concurrent aggregation protection
+### Concurrent Aggregation Protection
 
 Before looking up the group, the worker obtains a PostgreSQL transaction-level advisory lock derived from the aggregation key. When it finds an existing group, it also uses `FOR UPDATE` to lock that row while the transaction is active.
 
@@ -305,7 +366,7 @@ The repository contains these test cases, but their presence alone does not esta
 
 ## Limitations and Future Improvements
 
-### Current limitations
+### Current Limitations
 
 - Direct integrations with external notification providers are not implemented; the system currently accepts generic event payloads.
 - The normal failed-event dead-letter transfer is not atomic with processing-list removal.
@@ -314,7 +375,7 @@ The repository contains these test cases, but their presence alone does not esta
 - The aggregation window and grouping fields are fixed in the current implementation.
 - A dead-letter queue exists, but a complete dead-letter inspection and replay workflow is not implemented in the reviewed code.
 
-### Possible improvements
+### Possible Improvements
 
 - Make normal dead-letter transfer and processing-list acknowledgement atomic.
 - Add metrics for queue depth, retry counts, processing latency, and dead-letter volume.
