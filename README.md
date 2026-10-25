@@ -1,329 +1,345 @@
 # Notification Aggregator
 
-A backend project that receives application events, stores them durably,
-queues them for asynchronous processing, and creates individual and
-grouped notifications. It uses **FastAPI, PostgreSQL, Redis, and
-SQLAlchemy's async ORM** to separate event ingestion from background
-processing.
+A backend application for receiving events, persisting them in PostgreSQL, processing them asynchronously through Redis, and generating individual and aggregated notifications.
 
-The project focuses on backend engineering concepts such as the **outbox
-pattern, producer--consumer processing, retry scheduling, dead-letter
-handling, idempotency safeguards, and concurrent aggregation**.
+The project demonstrates practical backend engineering concepts including the **outbox pattern, producer–consumer processing, Redis queue recovery, retry scheduling, dead-letter handling, database idempotency safeguards, and concurrency control**.
 
-## Overview
+## Table of Contents
 
-Applications often generate many events, and processing each event
-directly inside the request can make an API slower and harder to recover
-when a dependency fails.
+- [Problem Statement](#problem-statement)
+- [Key Features](#key-features)
+- [Technology Stack](#technology-stack)
+- [System Architecture](#system-architecture)
+- [Event Processing Workflow](#event-processing-workflow)
+- [API Routes and Endpoints](#api-routes-and-endpoints)
+- [Failure Handling and Reliability](#failure-handling-and-reliability)
+- [Database Design](#database-design)
+- [Important Engineering Decisions](#important-engineering-decisions)
+- [Testing](#testing)
+- [Limitations and Future Improvements](#limitations-and-future-improvements)
+- [What This Project Demonstrates](#what-this-project-demonstrates)
 
-Notification Aggregator separates the work into stages:
+## Problem Statement
 
--   **Persist:** Save the incoming event and an outbox record in the
-    same PostgreSQL transaction.
--   **Deliver:** An outbox worker transfers pending events to a Redis
-    queue.
--   **Process:** A separate worker consumes queued events and writes
-    notification data to PostgreSQL.
--   **Aggregate:** Related unread events can be grouped into a summary
-    notification.
--   **Recover:** Failed work can be retried, recovered from the
-    processing queue, or moved to a dead-letter queue.
+Processing every event completely inside an API request can make request handling slower and makes recovery harder when a dependent service is temporarily unavailable.
 
-> **Scope note:** The current project accepts generic event payloads. It
-> does not itself contain integrations that fetch notifications directly
-> from Gmail, WhatsApp, or other external applications.
+Notification Aggregator separates event acceptance from background processing. It first stores an event and its delivery record in PostgreSQL, then uses an outbox worker and Redis queue to pass the event to a background worker. The worker creates an individual notification and, when the event has a suitable entity ID, adds it to an aggregated notification group.
 
-## Architecture
+**Scope:** The current application accepts generic event payloads. Direct integrations that fetch notifications from Gmail, WhatsApp, or other external applications are not implemented in the reviewed code.
 
-``` mermaid
+## Key Features
+
+- **Transactional event persistence:** Stores the event and its outbox record in one PostgreSQL transaction.
+- **Outbox-based delivery:** A separate worker retries delivery of pending outbox records to Redis.
+- **Asynchronous event processing:** Uses Redis lists to decouple event ingestion from notification processing.
+- **Atomic queue transfer:** Uses Redis `BLMOVE` to transfer events from the main queue to the processing queue.
+- **Processing recovery:** Moves entries left in the processing queue back to the main queue when the worker starts.
+- **Retry scheduling:** Uses exponential backoff with a Redis sorted set to schedule retries.
+- **Dead-letter handling:** Sends malformed payloads and events that exceed the retry allowance to a dead-letter queue.
+- **Individual notifications:** Creates a notification for an event, with a unique constraint on `event_id` to help avoid duplicate notification rows.
+- **Notification aggregation:** Groups eligible unread events by user, event type, and entity ID.
+- **Concurrency control:** Uses PostgreSQL advisory locks and row locks while updating aggregation groups.
+- **Structured logging:** Records processing activity, retries, delivery failures, and other operational events.
+
+## Technology Stack
+
+| Technology | Role |
+|---|---|
+| Python | Application and worker implementation |
+| FastAPI | HTTP API |
+| Pydantic | Incoming event validation |
+| PostgreSQL | Durable event, outbox, and notification storage |
+| SQLAlchemy Async ORM | Asynchronous database access and transactions |
+| Redis | Event queues, processing list, retry schedule, and dead-letter queue |
+| Redis Lua scripts | Atomic multi-command Redis transitions |
+| Pytest / pytest-asyncio | Asynchronous worker tests |
+
+## System Architecture
+
+```mermaid
 flowchart TD
-    A[Incoming event] --> B[(PostgreSQL: Events)]
-    A --> C[(PostgreSQL: Outbox)]
-    C --> D[Outbox worker]
-    D --> E[(Redis: queue:events)]
-    E --> F[Background worker]
-    F --> G[(PostgreSQL: Notifications)]
-    F --> H[(PostgreSQL: Aggregated notifications)]
-    F --> I[(Redis: retry:scheduled)]
-    I --> E
-    F --> J[(Redis: queue:dead)]
+    A[Client submits event] --> B[FastAPI event endpoint]
+    B --> C[(PostgreSQL: Events)]
+    B --> D[(PostgreSQL: Outbox events)]
+    D --> E[Outbox worker]
+    E --> F[(Redis: queue:events)]
+    F --> G[Background worker]
+    G --> H[(PostgreSQL: Notifications)]
+    G --> I[(PostgreSQL: Aggregated notifications)]
+    G --> J[(Redis: retry:scheduled)]
+    J --> F
+    G --> K[(Redis: queue:dead)]
 ```
 
-PostgreSQL is the durable store for event and notification records.
-Redis is used for queueing, processing-state tracking, scheduled
-retries, and dead-letter storage.
+**Component responsibilities**
 
-## Core Features
+- **FastAPI:** Validates the incoming event and persists the event plus outbox record.
+- **PostgreSQL:** Stores the durable application records and their processing/delivery status.
+- **Outbox worker:** Attempts to deliver pending outbox payloads to Redis.
+- **Redis:** Holds queued, processing, retry-scheduled, and dead-letter events.
+- **Background worker:** Creates individual notifications, updates event status, and maintains aggregation groups.
 
-### 1. Transactional event persistence and outbox
+## Event Processing Workflow
 
-When an event is accepted, the application creates an `Events` record
-and an `outbox_events` record in the same PostgreSQL transaction. This
-records both the event and the intent to deliver it to Redis.
+1. **Receive an event.** The `POST /events` endpoint validates the JSON request using the `EventRequest` Pydantic model.
+2. **Persist the event.** The endpoint inserts a record into `Events` and a corresponding record into `outbox_events` within the same PostgreSQL transaction.
+3. **Deliver from the outbox.** The outbox worker selects pending records in batches of up to 20. It uses `FOR UPDATE SKIP LOCKED` to help concurrent outbox workers claim different records.
+4. **Enqueue in Redis.** The outbox worker pushes the event payload to `queue:events`. When enqueueing succeeds, it marks the outbox record as delivered.
+5. **Move to processing.** The background worker uses `BLMOVE` to move an event from `queue:events` to `queue:processing`.
+6. **Create the individual notification.** Inside a PostgreSQL transaction, the worker attempts to insert a notification and updates the original event's status to `processed`.
+7. **Aggregate when eligible.** If the individual notification is newly inserted and the event has an entity ID, the worker updates a matching unread aggregation or creates a new group.
+8. **Acknowledge or recover.** After successful processing, the worker removes the event from the processing list. Failed events are scheduled for retry or moved to the dead-letter queue. Entries left in the processing list can be recovered when the worker starts.
 
-The outbox worker:
+## API Routes and Endpoints
 
--   Selects pending records in batches of up to 20.
--   Uses `FOR UPDATE SKIP LOCKED` to help multiple workers claim
-    different records.
--   Attempts to enqueue each payload in Redis.
--   Marks a record as `delivered` and sets `delivered_at` after a
-    successful enqueue.
--   Leaves a record pending when enqueueing fails so it can be attempted
-    again.
+### `GET /health`
 
-This reduces the chance of losing the delivery intent if Redis is
-unavailable. It does not guarantee exactly-once delivery between
-PostgreSQL and Redis; a crash after enqueueing but before the database
-transaction commits can result in a duplicate queue entry.
+Checks whether the API process is responding.
 
-### 2. Redis producer--consumer queue
+**Success response — `200 OK`**
 
-The Redis queue uses these keys:
+```json
+{
+  "status": "healthy"
+}
+```
 
-  -----------------------------------------------------------------------
-  Redis key                           Purpose
-  ----------------------------------- -----------------------------------
-  `queue:events`                      Events waiting to be processed
+> This is a basic API health check. It does not independently confirm that PostgreSQL and Redis are reachable.
 
-  `queue:processing`                  Events currently being handled by a
-                                      worker
+### `POST /events`
 
-  `retry:scheduled`                   Sorted set of failed events with
-                                      their next eligible retry time
+Accepts an event, validates the JSON request using the `EventRequest` model, and stores the event and its outbox record in PostgreSQL. The event is processed asynchronously by a background worker.
 
-  `queue:dead`                        Events that cannot be processed
-                                      further, including malformed
-                                      payloads
-  -----------------------------------------------------------------------
+**Example request**
 
-Events are serialized as JSON before being pushed to Redis.
+```json
+{
+  "event_id": "evt_101",
+  "event_type": "COMMENT_CREATED",
+  "user_id": 101,
+  "source": "document_service",
+  "entity_id": "doc_55",
+  "payload": {
+    "entity_id": "doc_55",
+    "comment": "A new comment was added"
+  }
+}
+```
 
-### 3. Atomic queue transfer and recovery
+**Success response — `202 Accepted`**
 
-The worker uses Redis `BLMOVE` to move an event from `queue:events` to
-`queue:processing` as one Redis operation. This avoids a separate
-pop-then-push gap during normal dequeueing.
+```json
+{
+  "notification_id": "generated-uuid",
+  "status": "accepted"
+}
+```
 
-When the worker starts, it checks `queue:processing` and moves
-unfinished entries back to the main queue using `LMOVE`. This provides a
-recovery path for events left behind after a worker interruption.
+The response field is named `notification_id` in the current code, but the UUID is generated when the event is accepted. It does **not** mean that the background worker has already created the individual notification.
 
-Successfully processed events are removed from the processing list.
+**Request fields**
 
-### 4. Retry scheduling and dead-letter handling
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `event_id` | String | Yes | Identifier for the logical event; must be unique in the events table. |
+| `event_type` | String | Yes | Type of event, such as `COMMENT_CREATED`. |
+| `user_id` | Integer | Yes | User associated with the event. |
+| `source` | String | Yes | System or service that produced the event. |
+| `entity_id` | String or null | No | Related entity; used to build the aggregation key. |
+| `payload` | Object or null | No | Additional event data. |
 
-When event processing raises an exception, the worker increments the
-event's `retry_count` and schedules a retry. Retry times use exponential
-delays calculated as:
+**Error responses**
 
-``` text
+| HTTP status | Meaning |
+|---|---|
+| `409 Conflict` | The `event_id` already exists in the events table. |
+| `500 Internal Server Error` | An unhandled event-persistence error occurs. |
+| `422 Unprocessable Entity` | The request does not satisfy FastAPI/Pydantic validation. |
+
+---
+
+## Failure Handling and Reliability
+
+### 1. Outbox delivery
+
+The event and its outbox record are committed together in PostgreSQL. If Redis enqueueing fails, the outbox worker leaves the record pending so it can be attempted again.
+
+This preserves the delivery intent, but it does not guarantee exactly-once delivery. If Redis accepts a payload and the outbox worker fails before the PostgreSQL transaction commits, the payload may be enqueued again.
+
+### 2. Redis queues
+
+| Redis key | Purpose |
+|---|---|
+| `queue:events` | Events waiting to be processed. |
+| `queue:processing` | Events currently being processed or awaiting acknowledgement. |
+| `retry:scheduled` | Sorted set containing failed events and their next retry timestamps. |
+| `queue:dead` | Dead-letter list for malformed or repeatedly failing events. |
+
+### 3. Atomic queue movement and recovery
+
+- **`BLMOVE`:** Moves an event from `queue:events` to `queue:processing` in one Redis operation.
+- **`LMOVE`:** During worker startup, moves leftover entries from `queue:processing` back to `queue:events`.
+- **Processing acknowledgement:** After processing, the worker removes the event from `queue:processing`.
+
+These mechanisms reduce the risk of losing an event between the main and processing lists. Startup recovery is not the same as a continuous visibility-timeout mechanism for a worker that remains running.
+
+### 4. Exponential backoff
+
+When processing raises an exception, the worker increments `retry_count` and calculates the delay as follows:
+
+```python
 delay_seconds = 2 ** retry_count
 ```
 
-With the current counter logic, the scheduled delays are 2, 4, and 8
-seconds for retry counts 1, 2, and 3. The worker allows up to **three
-retries after the initial attempt**; a further failure is moved to
-`queue:dead`.
+| Retry count | Scheduled delay |
+|---:|---:|
+| 1 | 2 seconds |
+| 2 | 4 seconds |
+| 3 | 8 seconds |
 
-Due retries are stored in a Redis sorted set and checked by the worker
-loop. A Lua script atomically removes a due event from `retry:scheduled`
-and pushes it to `queue:events`, avoiding a crash gap between those two
-Redis operations.
+The worker allows **three retries after the initial attempt**. A subsequent failure exceeds the retry limit and is moved to `queue:dead`.
 
-Malformed JSON found in the processing list is moved to the dead-letter
-list using a Lua script that removes the malformed item and pushes it to
-the dead-letter list in one Redis-side operation.
+### 5. Lua scripts
 
-**Reliability limitation:** Moving an ordinary failed event to
-`queue:dead` and removing its processing copy are currently separate
-Redis commands. A crash between those commands can leave a copy in both
-lists. The dead-letter path is therefore useful failure handling, but
-not a fully atomic transfer in every case.
+The project uses Lua scripts for two Redis transitions:
 
-### 5. Individual notifications and idempotency safeguards
+**Scheduled retry → main queue**
 
-The worker creates an individual notification with a message similar to:
+The script removes a due event from `retry:scheduled` and pushes it to `queue:events` as one atomic Redis-side operation.
 
-``` text
-Event COMMENT_CREATED received from document_service
-```
+**Malformed processing item → dead-letter queue**
 
-The `Notifications.event_id` field is unique. The worker uses PostgreSQL
-`INSERT ... ON CONFLICT DO NOTHING` and checks whether an ID was
-returned from the insert. If the notification already exists, it skips
-aggregation for that duplicate.
+The script removes the malformed raw item from `queue:processing` and pushes it to `queue:dead` atomically.
 
-This helps prevent retries from creating duplicate individual
-notifications or incrementing an aggregation twice through this worker
-path.
+These scripts prevent a crash gap between the remove and push operations in those specific transitions.
 
-### 6. Event aggregation
+### 6. Database transactions and idempotency
 
-Events can be grouped when they share the same user, event type, and
-entity.
+The worker performs the individual notification insert, event status update, and aggregation work inside a PostgreSQL transaction. If a database operation fails before commit, the transaction's changes roll back together.
 
-The aggregation key is constructed as:
+The `Notifications.event_id` column is unique. The worker uses `ON CONFLICT DO NOTHING` and checks whether the insert returned an ID. If the notification already exists, it skips aggregation for that duplicate event.
 
-``` text
+### 7. Known reliability boundaries
+
+- Moving a normal failed event to `queue:dead` and removing its processing-list copy are separate Redis commands. A crash between them can leave copies in both lists.
+- PostgreSQL and Redis do not share a distributed transaction, so duplicate queue delivery remains possible.
+- Processing-queue recovery runs when the worker starts; it does not continuously reclaim work from a worker that is still running.
+- The aggregation key is indexed but is not declared unique in the database.
+- These mechanisms improve recovery and duplicate handling, but the project does **not** guarantee exactly-once processing across PostgreSQL and Redis.
+
+---
+
+## Database Design
+
+The project defines four main SQLAlchemy models.
+
+| Model | Table | Responsibility |
+|---|---|---|
+| `events` | `Events` | Stores original event data and processing status. |
+| `OutboxEvent` | `outbox_events` | Stores the event payload and delivery status. |
+| `Notify` | `Notifications` | Stores individual notifications. |
+| `AggregatedNotification` | `aggregated_notifications` | Stores grouped notification summaries. |
+
+### Important fields and constraints
+
+| Model | Important fields / constraints | Why it matters |
+|---|---|---|
+| `Events` | `event_id` is unique; stores event type, user ID, source, optional entity ID, payload, status, and creation timestamp. | Identifies a logical event and tracks its processing state. |
+| `OutboxEvent` | `event_id` is unique and indexed; includes `status` and `delivered_at`. | Tracks pending and completed delivery attempts. |
+| `Notify` | `event_id` is unique; stores user ID, message, read status, and creation timestamp. | Helps enforce at most one individual notification per event ID. |
+| `AggregatedNotification` | `aggregation_key` is indexed; stores `event_count`, message, read status, and first/last event timestamps. | Supports looking up and updating a grouped notification. |
+| All four models | UUID primary keys identify database rows. | Gives each stored row its own identifier. |
+
+**Relationship note:** The models do not declare explicit foreign-key relationships between these four tables. Their event IDs connect records conceptually, but that is not the same as a database-enforced foreign key.
+
+### Aggregation logic
+
+The aggregation key is constructed from the user ID, event type, and entity ID:
+
+```text
 {user_id}:{event_type}:{entity_id}
 ```
 
-For example:
+**Example**
 
-``` text
+```text
 101:COMMENT_CREATED:doc_55
 ```
 
-The worker looks for an aggregation that has the same key, is unread,
-and has received an event within the previous hour.
+The worker looks for an aggregation with the same key that is unread and whose `last_event_at` is within the previous hour.
 
--   If a matching aggregation exists, its `event_count`,
-    `last_event_at`, and summary message are updated.
--   Otherwise, a new aggregation is created with an initial count of
-    one.
--   If an event has no entity ID in either its top-level field or
-    payload, the worker skips aggregation for it.
+| Condition | Worker behavior |
+|---|---|
+| A matching unread group exists within the one-hour window. | Increments `event_count` and updates the message and `last_event_at`. |
+| No eligible group exists. | Creates a new group with `event_count = 1`. |
+| The event has no entity ID in either the top-level field or payload. | Skips aggregation for that event. |
+| The individual notification already exists. | Skips aggregation for that duplicate processing attempt. |
 
-The one-hour condition is a **sliding window based on the latest event
-time**, not a fixed hourly batch.
+The one-hour condition is a **sliding window** based on the latest event time, not a fixed hourly batch.
 
-### 7. Concurrent aggregation protection
+### Concurrent aggregation protection
 
-The worker obtains a PostgreSQL transaction-level advisory lock based on
-the hash of the aggregation key before searching for a matching group.
-It also uses `FOR UPDATE` when selecting an existing aggregation row.
+Before looking up the group, the worker obtains a PostgreSQL transaction-level advisory lock derived from the aggregation key. When it finds an existing group, it also uses `FOR UPDATE` to lock that row while the transaction is active.
 
-These mechanisms coordinate concurrent updates and reduce the risk of
-multiple workers creating or modifying the same group at the same time
-through this code path.
+These locks coordinate concurrent aggregation work through this worker path. However, `aggregation_key` is indexed rather than unique, so the database does not independently enforce one row per aggregation key.
 
-The `aggregation_key` has an index but is not declared unique in the
-model. The advisory lock is application-level coordination, not a
-database-enforced uniqueness constraint.
+---
 
-### 8. Structured logging
+## Important Engineering Decisions
 
-The shared logger writes timestamped messages with the log level and
-component name to both the console and `app.log`. The worker and outbox
-worker log processing activity, failures, retries, and delivery results.
-
-## Data Model
-
-  ----------------------------------------------------------------------------
-  Model / table                Responsibility          Important fields
-  ---------------------------- ----------------------- -----------------------
-  `events` / `Events`          Original event and      `event_id`,
-                               processing state        `event_type`,
-                                                       `user_id`, `source`,
-                                                       `entity_id`, `payload`,
-                                                       `status`, `created_at`
-
-  `OutboxEvent` /              Pending delivery intent `event_id`, `payload`,
-  `outbox_events`              and delivery state      `status`, `created_at`,
-                                                       `delivered_at`
-
-  `Notify` / `Notifications`   Individual notification `event_id`, `user_id`,
-                               per event               `message`, `read`,
-                                                       `created_at`
-
-  `AggregatedNotification` /   Grouped summary of      `aggregation_key`,
-  `aggregated_notifications`   related events          `event_count`,
-                                                       `message`, `read`,
-                                                       `first_event_at`,
-                                                       `last_event_at`
-  ----------------------------------------------------------------------------
-
-UUID primary keys identify database rows. Unique constraints on event
-IDs in the event, outbox, and individual notification models help
-prevent duplicate records. The models do not declare explicit
-foreign-key relationships between these tables.
-
-## Engineering Decisions
-
--   **PostgreSQL for durable state:** Events, delivery status,
-    individual notifications, and aggregated notifications remain in a
-    relational database.
--   **Redis for queue operations:** Queueing and retry scheduling are
-    separated from durable application records.
--   **Outbox pattern:** The event and its delivery intent are committed
-    together before Redis delivery is attempted.
--   **Separate workers:** Outbox delivery and event processing happen
-    outside the event-ingestion operation.
--   **Redis list movement:** `BLMOVE` and `LMOVE` reduce the risk of
-    losing an event between the main and processing lists during
-    transfer.
--   **Lua for multi-command Redis transitions:** Due retries and
-    malformed processing entries use scripts to perform their
-    remove-and-push transitions atomically.
--   **Database transactions:** Notification creation, event status
-    updates, and aggregation work are grouped in a PostgreSQL
-    transaction.
--   **Idempotency safeguards:** Unique constraints and conflict-aware
-    inserts help make repeated processing safer.
--   **Concurrency control:** Advisory locks and row-level locks
-    coordinate aggregation work.
+| Decision | Why it is used |
+|---|---|
+| **PostgreSQL for durable records** | Stores events, outbox state, individual notifications, and aggregated notifications. |
+| **Redis for asynchronous work** | Separates queue operations and retry scheduling from the request-handling path. |
+| **Outbox pattern** | Commits the event and its delivery intent together before Redis delivery is attempted. |
+| **Separate workers** | Keeps outbox delivery and event processing outside the event-acceptance operation. |
+| **`BLMOVE` and `LMOVE`** | Atomically move entries between the main and processing lists and support startup recovery. |
+| **Lua scripts** | Make the scheduled-retry transfer and malformed-item dead-letter transfer atomic within Redis. |
+| **PostgreSQL transactions** | Keep the notification insert, event status update, and aggregation changes in one database transaction. |
+| **Unique constraints and conflict-aware inserts** | Help prevent duplicate event and individual-notification records. |
+| **Advisory locks and row locks** | Coordinate concurrent aggregation updates. |
+| **Explicit reliability boundaries** | Acknowledge that recovery and idempotency safeguards reduce failure risks but do not guarantee exactly-once processing across PostgreSQL and Redis. |
 
 ## Testing
 
-The repository includes asynchronous tests in `tests/test_worker.py` and
-fixtures in `tests/conftest.py`. The test scenarios cover areas
-including:
+The repository includes asynchronous worker tests in `tests/test_worker.py` and test fixtures in `tests/conftest.py`.
 
--   Processing an event from Redis and verifying its database status and
-    notification.
--   Scheduling a failed event for retry.
--   Creating a new aggregation.
--   Updating an existing aggregation and incrementing its event count.
--   Duplicate-event behavior and Redis queue operations.
+The test scenarios include:
 
-The tests use configurable test database and Redis URLs. The existence
-of these tests does not by itself establish that the entire suite passes
-in every environment; run the suite in a configured test environment to
-confirm the current result.
+- Processing a Redis event and checking the resulting database state.
+- Concurrent processing and duplicate-event handling.
+- Scheduling a failed event for retry.
+- Creating a new aggregation.
+- Updating an existing aggregation and incrementing its event count.
+- Creating a new group when an earlier aggregation is read or outside the one-hour window.
+- Skipping aggregation when an entity ID is missing.
+- Moving an event to the dead-letter queue after the retry limit is exceeded.
 
-## Known Limitations
+The repository contains these test cases, but their presence alone does not establish that the entire suite passes in every environment.
 
--   The project processes generic events; direct integrations with
-    external notification providers are not implemented in the current
-    code.
--   PostgreSQL and Redis do not share a distributed transaction.
-    Duplicate delivery remains possible, so the system relies on
-    database safeguards to make repeated processing safer.
--   Dead-lettering a normal failed event and removing its
-    processing-list entry are separate operations, leaving a crash
-    window.
--   The aggregation key is indexed but not unique at the database level.
--   The current aggregation logic uses a one-hour sliding window and
-    unread status; it is not a configurable time-window or
-    user-preference engine.
--   A dead-letter queue is implemented, but a complete dead-letter
-    inspection, replay, and operational management workflow is not
-    present in the reviewed code.
+## Limitations and Future Improvements
 
-## Future Improvements
+### Current limitations
 
--   Make failed-event dead-letter transfer and processing-list
-    acknowledgement atomic.
--   Add monitoring and metrics for queue depth, retry counts, processing
-    latency, and dead-letter volume.
--   Add a controlled dead-letter inspection and replay workflow.
--   Add explicit foreign-key relationships where appropriate and
-    consider database-enforced aggregation uniqueness.
--   Add integration adapters for external notification sources when
-    their APIs and permissions are available.
--   Add configurable aggregation rules and user preferences.
--   Expand automated tests for worker crashes, concurrent aggregation
-    creation, and PostgreSQL/Redis failure scenarios.
+- Direct integrations with external notification providers are not implemented; the system currently accepts generic event payloads.
+- The normal failed-event dead-letter transfer is not atomic with processing-list removal.
+- PostgreSQL and Redis do not share a distributed transaction.
+- Aggregation uniqueness is coordinated by the worker but is not enforced by a unique database constraint.
+- The aggregation window and grouping fields are fixed in the current implementation.
+- A dead-letter queue exists, but a complete dead-letter inspection and replay workflow is not implemented in the reviewed code.
+
+### Possible improvements
+
+- Make normal dead-letter transfer and processing-list acknowledgement atomic.
+- Add metrics for queue depth, retry counts, processing latency, and dead-letter volume.
+- Build a controlled dead-letter inspection and replay workflow.
+- Add explicit foreign-key relationships where appropriate and evaluate database-enforced aggregation uniqueness.
+- Add external notification-source adapters when the relevant APIs and permissions are available.
+- Make aggregation rules configurable.
+- Expand tests for worker crashes and PostgreSQL/Redis failure scenarios.
 
 ## What This Project Demonstrates
 
-Notification Aggregator is a backend engineering project focused on
-asynchronous event processing and practical failure handling. It brings
-together relational persistence, Redis queues, an outbox delivery
-workflow, retry scheduling, dead-letter handling, idempotency
-safeguards, and concurrent notification aggregation.
+Notification Aggregator demonstrates backend concepts beyond basic CRUD operations: durable event persistence, an outbox delivery workflow, Redis-based producer–consumer processing, retry scheduling, dead-letter handling, idempotency safeguards, transactional database updates, and concurrent notification aggregation.
 
-The design aims to make event processing easier to recover and reason
-about while documenting the remaining failure windows rather than
-claiming exactly-once delivery.
+The design focuses on making event processing easier to recover and reason about while clearly documenting the remaining reliability limitations.
