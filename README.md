@@ -92,20 +92,6 @@ flowchart TD
 
 ## API Routes and Endpoints
 
-### `GET /health`
-
-Checks whether the API process is responding.
-
-**Success response — `200 OK`**
-
-```json
-{
-  "status": "healthy"
-}
-```
-
-> This is a basic API health check. It does not independently confirm that PostgreSQL and Redis are reachable.
-
 ### `POST /events`
 
 Accepts an event, validates the JSON request using the `EventRequest` model, and stores the event and its outbox record in PostgreSQL. The event is processed asynchronously by a background worker.
